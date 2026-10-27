@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/build/
+.next/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+pgdata/
+
+# Storage (firmware binaries)
+storage/*.bin
+storage/**/*.bin
+!storage/.gitkeep
+
+# TLS certs (generated locally)
+mosquitto/config/certs/
+certs/
+
+# Logs
+*.log
+logs/
+
+# Coverage
+htmlcov/
+.coverage
+coverage/
+
+# Ngrok
+ngrok.yml
