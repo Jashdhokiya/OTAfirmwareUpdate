@@ -55,6 +55,7 @@ services:
       FIRMWARE_STORAGE_PATH: /app/storage
       MAX_FIRMWARE_SIZE_MB: ${MAX_FIRMWARE_SIZE_MB:-4}
     volumes:
+      - ./backend/app:/app/app
       - ./storage:/app/storage
     depends_on:
       postgres:

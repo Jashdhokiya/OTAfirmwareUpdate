@@ -73,7 +73,9 @@ class DeviceService:
         # Generate API key
         api_key = str(uuid.uuid4())
 
+        device_id = str(uuid.uuid4())
         device = Device(
+            id=device_id,
             device_uid=data.device_uid,
             display_name=data.display_name,
             hardware_model=data.hardware_model,
@@ -90,7 +92,6 @@ class DeviceService:
             description=f"Device {data.display_name} registered",
         )
         db.add(event)
-
         await db.flush()
         return device, api_key
 

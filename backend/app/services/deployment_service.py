@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 from app.models.deployment import Deployment, DeviceDeploymentAttempt
 from app.models.device import Device
 from app.models.firmware import FirmwareRelease
@@ -25,7 +26,7 @@ class DeploymentService:
     async def list_deployments(
         db: AsyncSession, status_filter: Optional[str] = None, limit: int = 50
     ) -> list[Deployment]:
-        query = select(Deployment).order_by(Deployment.created_at.desc()).limit(limit)
+        query = select(Deployment).options(joinedload(Deployment.firmware_release)).order_by(Deployment.created_at.desc()).limit(limit)
         if status_filter:
             query = query.where(Deployment.status == status_filter)
         result = await db.execute(query)
@@ -34,7 +35,7 @@ class DeploymentService:
     @staticmethod
     async def get_deployment(db: AsyncSession, deployment_id: str) -> Optional[Deployment]:
         result = await db.execute(
-            select(Deployment).where(Deployment.id == deployment_id)
+            select(Deployment).options(joinedload(Deployment.firmware_release)).where(Deployment.id == deployment_id)
         )
         return result.scalar_one_or_none()
 
@@ -92,6 +93,7 @@ class DeploymentService:
         db.add(audit)
 
         await db.flush()
+        deployment.firmware_release = release
         return deployment
 
     @staticmethod
@@ -152,9 +154,10 @@ class DeploymentService:
         strategy = deployment.rollout_strategy or {"type": "immediate"}
         strategy_type = strategy.get("type", "immediate")
 
-        # Get pending attempts
+        # Get pending attempts with device eagerly loaded
         result = await db.execute(
             select(DeviceDeploymentAttempt)
+            .options(joinedload(DeviceDeploymentAttempt.device))
             .where(
                 DeviceDeploymentAttempt.deployment_id == deployment_id,
                 DeviceDeploymentAttempt.status == "pending",
@@ -226,7 +229,9 @@ class DeploymentService:
 
         # Cancel pending attempts
         result = await db.execute(
-            select(DeviceDeploymentAttempt).where(
+            select(DeviceDeploymentAttempt)
+            .options(joinedload(DeviceDeploymentAttempt.device))
+            .where(
                 DeviceDeploymentAttempt.deployment_id == deployment_id,
                 DeviceDeploymentAttempt.status.in_(["pending", "command_sent"]),
             )
@@ -254,16 +259,25 @@ class DeploymentService:
         """Process a deployment acknowledgement from a device."""
         # Find the attempt by command_id
         result = await db.execute(
-            select(DeviceDeploymentAttempt).where(
-                DeviceDeploymentAttempt.command_id == command_id
-            )
+            select(DeviceDeploymentAttempt)
+            .options(joinedload(DeviceDeploymentAttempt.device))
+            .where(DeviceDeploymentAttempt.command_id == command_id)
         )
         attempt = result.scalar_one_or_none()
         if not attempt:
             logger.warning(f"No attempt found for command_id {command_id}")
             return
 
+        # Prevent duplicate counting if attempt is already in a terminal state
+        if attempt.status in ("success", "failed", "timeout", "cancelled"):
+            logger.info(
+                f"Attempt {attempt.id} already in terminal state '{attempt.status}', "
+                f"ignoring duplicate ACK '{status}'"
+            )
+            return
+
         now = datetime.now(timezone.utc)
+        prev_status = attempt.status
         attempt.status = status
         attempt.updated_at = now
         attempt.error_code = error_code
@@ -275,7 +289,7 @@ class DeploymentService:
         # Update deployment counters
         deployment = await DeploymentService.get_deployment(db, attempt.deployment_id)
         if deployment:
-            if status == "success":
+            if status == "success" and prev_status != "success":
                 deployment.successful_devices += 1
                 # Update device firmware version
                 device = attempt.device
@@ -292,7 +306,7 @@ class DeploymentService:
                 )
                 db.add(event)
 
-            elif status == "failed":
+            elif status == "failed" and prev_status != "failed":
                 deployment.failed_devices += 1
 
                 event = DeviceEvent(

@@ -36,27 +36,25 @@
 // CONFIGURATION — Edit these values for your setup
 // ============================================================
 
-// WiFi credentials
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD  = "YOUR_WIFI_PASSWORD";
+// WiFi credentials — Fill in your WiFi network details
+const char* WIFI_SSID     = "Jash's OnePlus Nord 5";
+const char* WIFI_PASSWORD  = "jash1234";
 
-// Fleet Manager backend URL (set to ngrok URL for cross-network)
-// Example: "http://192.168.1.100:8000" or "https://abc123.ngrok-free.app"
-const char* SERVER_URL     = "http://192.168.1.100:8000";
+// Fleet Manager backend URL
+const char* SERVER_URL     = "http://10.106.172.228:8000";
 
-// MQTT Broker (set to ngrok TCP URL for cross-network)
-// Example: "192.168.1.100" or "0.tcp.ngrok.io"
-const char* MQTT_HOST      = "192.168.1.100";
+// MQTT Broker
+const char* MQTT_HOST      = "10.106.172.228";
 const int   MQTT_PORT      = 1883;
 const char* MQTT_USER      = "fleet_backend";
 const char* MQTT_PASS      = "fleet_mqtt_pass";
 
-// Device identity — set after registering in the dashboard
-const char* DEVICE_UID     = "";   // Your MAC-based UID, e.g., "AABBCCDDEEFF"
-const char* DEVICE_API_KEY = "";   // API key from device registration
+// Device identity — leave DEVICE_UID empty to auto-detect from hardware MAC
+const char* DEVICE_UID     = "";
+const char* DEVICE_API_KEY = "esp32_secret_key_123";
 
 // Current firmware version — increment with each new build
-const char* FIRMWARE_VERSION = "1";
+const char* FIRMWARE_VERSION = "2.2.0";
 
 // ============================================================
 // TIMING CONSTANTS
@@ -204,7 +202,7 @@ void handleFirmwareUpdate(JsonDocument& cmd) {
   Serial.printf("[OTA] Expected SHA256: %s\n", expectedHash);
   Serial.printf("[OTA] Expected size: %d bytes\n", expectedSize);
 
-  // Step 2: Download firmware and compute SHA-256
+  // Step 2, 3 & 4: Stream firmware in chunks directly to flash & verify SHA-256
   sendDeploymentAck(commandId, "downloading", NULL, NULL);
 
   HTTPClient dlHttp;
@@ -228,33 +226,56 @@ void handleFirmwareUpdate(JsonDocument& cmd) {
     return;
   }
 
-  Serial.printf("[OTA] Downloading %d bytes...\n", contentLength);
+  Serial.printf("[OTA] Streaming %d bytes to OTA partition...\n", contentLength);
 
-  // Get the stream
-  WiFiClient* stream = dlHttp.getStreamPtr();
-
-  // Allocate buffer for the entire firmware
-  uint8_t* firmwareBuf = (uint8_t*)malloc(contentLength);
-  if (!firmwareBuf) {
-    Serial.println("[OTA] Failed to allocate memory for firmware");
-    sendDeploymentAck(commandId, "failed", "MEMORY_ERROR", "Cannot allocate firmware buffer");
+  // Initialize OTA partition
+  if (!Update.begin(contentLength)) {
+    Serial.printf("[OTA] Update.begin() failed: %s\n", Update.errorString());
+    sendDeploymentAck(commandId, "failed", "UPDATE_BEGIN_ERROR", Update.errorString());
     dlHttp.end();
     return;
   }
 
-  // Read all data
+  // Initialize SHA-256 context
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+
+  // Stream in 1KB chunks to avoid large RAM allocations
+  WiFiClient* stream = dlHttp.getStreamPtr();
+  uint8_t chunkBuf[1024];
   int bytesRead = 0;
   unsigned long dlStart = millis();
-  while (bytesRead < contentLength && (millis() - dlStart) < 60000) {
-    if (stream->available()) {
-      int toRead = min((int)stream->available(), contentLength - bytesRead);
-      int read = stream->readBytes(firmwareBuf + bytesRead, toRead);
-      bytesRead += read;
 
-      // Progress every 10%
-      if (bytesRead % (contentLength / 10 + 1) < 512) {
-        Serial.printf("[OTA] Downloaded %d / %d bytes (%d%%)\n",
-          bytesRead, contentLength, (bytesRead * 100) / contentLength);
+  sendDeploymentAck(commandId, "installing", NULL, NULL);
+
+  while (dlHttp.connected() && (bytesRead < contentLength) && (millis() - dlStart < 120000)) {
+    size_t availableBytes = stream->available();
+    if (availableBytes > 0) {
+      int toRead = min((size_t)availableBytes, min((size_t)sizeof(chunkBuf), (size_t)(contentLength - bytesRead)));
+      int n = stream->readBytes(chunkBuf, toRead);
+      if (n > 0) {
+        // Hash chunk
+        mbedtls_sha256_update(&ctx, chunkBuf, n);
+
+        // Write chunk directly to flash
+        size_t written = Update.write(chunkBuf, n);
+        if (written != (size_t)n) {
+          Serial.printf("[OTA] Write mismatch: wrote %d / %d\n", written, n);
+          Update.abort();
+          mbedtls_sha256_free(&ctx);
+          dlHttp.end();
+          sendDeploymentAck(commandId, "failed", "WRITE_ERROR", "Flash write error");
+          return;
+        }
+
+        bytesRead += n;
+
+        // Progress logging every 10%
+        if (bytesRead % (contentLength / 10 + 1) < 1024) {
+          Serial.printf("[OTA] Downloaded & flashed %d / %d bytes (%d%%)\n",
+            bytesRead, contentLength, (bytesRead * 100) / contentLength);
+        }
       }
     }
     delay(1);
@@ -263,26 +284,18 @@ void handleFirmwareUpdate(JsonDocument& cmd) {
 
   if (bytesRead != contentLength) {
     Serial.printf("[OTA] Incomplete download: %d / %d bytes\n", bytesRead, contentLength);
+    Update.abort();
+    mbedtls_sha256_free(&ctx);
     sendDeploymentAck(commandId, "failed", "INCOMPLETE_DOWNLOAD",
       ("Got " + String(bytesRead) + " of " + String(contentLength)).c_str());
-    free(firmwareBuf);
     return;
   }
 
-  Serial.printf("[OTA] Download complete: %d bytes in %lu ms\n",
-    bytesRead, millis() - dlStart);
-
-  // Step 3: Verify SHA-256
-  Serial.println("[OTA] Computing SHA-256...");
+  // Finalize SHA-256 calculation
   uint8_t hash[32];
-  mbedtls_sha256_context ctx;
-  mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
-  mbedtls_sha256_update(&ctx, firmwareBuf, contentLength);
   mbedtls_sha256_finish(&ctx, hash);
   mbedtls_sha256_free(&ctx);
 
-  // Convert to hex string
   char computedHash[65];
   for (int i = 0; i < 32; i++) {
     sprintf(computedHash + (i * 2), "%02x", hash[i]);
@@ -294,41 +307,16 @@ void handleFirmwareUpdate(JsonDocument& cmd) {
 
   if (strcmp(computedHash, expectedHash) != 0) {
     Serial.println("[OTA] *** SHA-256 MISMATCH — REFUSING INSTALLATION ***");
-    sendDeploymentAck(commandId, "failed", "HASH_MISMATCH",
-      "SHA-256 verification failed");
-    free(firmwareBuf);
+    Update.abort();
+    sendDeploymentAck(commandId, "failed", "HASH_MISMATCH", "SHA-256 verification failed");
     return;
   }
 
   Serial.println("[OTA] SHA-256 verified ✓");
 
-  // Step 4: Install firmware to OTA partition
-  sendDeploymentAck(commandId, "installing", NULL, NULL);
-
-  if (!Update.begin(contentLength)) {
-    Serial.printf("[OTA] Update.begin() failed: %s\n",
-      Update.errorString());
-    sendDeploymentAck(commandId, "failed", "UPDATE_BEGIN_ERROR",
-      Update.errorString());
-    free(firmwareBuf);
-    return;
-  }
-
-  size_t written = Update.write(firmwareBuf, contentLength);
-  free(firmwareBuf);  // Free memory immediately
-
-  if (written != (size_t)contentLength) {
-    Serial.printf("[OTA] Write failed: wrote %d / %d\n", written, contentLength);
-    Update.abort();
-    sendDeploymentAck(commandId, "failed", "WRITE_ERROR",
-      ("Wrote " + String(written) + " of " + String(contentLength)).c_str());
-    return;
-  }
-
   if (!Update.end(true)) {
     Serial.printf("[OTA] Update.end() failed: %s\n", Update.errorString());
-    sendDeploymentAck(commandId, "failed", "UPDATE_END_ERROR",
-      Update.errorString());
+    sendDeploymentAck(commandId, "failed", "UPDATE_END_ERROR", Update.errorString());
     return;
   }
 
@@ -510,6 +498,13 @@ void setup() {
   Serial.printf("Flash Size: %d KB\n", ESP.getFlashChipSize() / 1024);
   Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
   Serial.println();
+
+  // Initialize WiFi station mode and read MAC address immediately
+  WiFi.mode(WIFI_STA);
+  deviceMac = WiFi.macAddress();
+  deviceMac.replace(":", "");
+  deviceMac.toUpperCase();
+  Serial.printf("Hardware MAC: %s\n", deviceMac.c_str());
 
   // Mark current firmware as valid (for rollback support)
   const esp_partition_t* running = esp_ota_get_running_partition();
